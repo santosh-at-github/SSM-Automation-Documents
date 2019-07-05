@@ -1,0 +1,137 @@
+{
+  "description": "Modify size of an EBS volume",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "volumeId": {
+      "type": "String",
+      "description": "(Required) EBS Volume to modify"
+    },
+    "desiredVolumeSize": {
+      "type": "Integer",
+      "description": "(Required) Target EBS volume size in GB"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "modifyEBSVolume",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyVolume",
+        "VolumeId": "{{ volumeId }}",
+        "Size": "{{ desiredVolumeSize }}"
+      },
+      "nextStep": "waitForOptimization"
+    },
+    {
+      "name": "waitForOptimization",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumesModifications",
+        "VolumeIds": [
+          "{{ volumeId }}"
+        ],
+        "PropertySelector": "VolumesModifications[0].ModificationState",
+        "DesiredValues": [
+          "optimizing",
+          "completed"
+        ]
+      },
+      "nextStep": "getInstanceId"
+    },
+    {
+      "name": "getInstanceId",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "VolumeIds": [
+          "{{ volumeId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "instanceId",
+          "Selector": "$.Volumes[0].Attachments[0].InstanceId",
+          "Type": "String"
+        },
+        {
+          "Name": "deviceName",
+          "Selector": "$.Volumes[0].Attachments[0].Device",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "RunShellScript"
+    },
+    {
+      "name": "RunShellScript",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "TimeoutSeconds": "3600",
+        "InstanceIds": [
+          "{{ getInstanceId.instanceId }}"
+        ],
+        "Parameters": {
+          "executionTimeout": "3600",
+          "commands": [
+            "#!/bin/bash -x",
+            "exec &> /var/log/SSM-Automation.log",
+            "DevName={{ getInstanceId.deviceName }}",
+            "VolumeId={{ volumeId }}",
+            "GrowFS(){",
+            "  FS=$(blkid /dev/$partition | grep -iEo 'TYPE=[^ ]*' | awk -F\\\" '{print $(NF-1)}')",
+            "  MountPoint=$(mount | grep $partition | awk '{print $3}')",
+            "  if [[ $FS =~ 'ext' ]]; then",
+            "    resize2fs /dev/$partition",
+            "  elif [[ $FS == 'xfs' ]]; then",
+            "    xfs_growfs $MountPoint",
+            "  else",
+            "    echo \"Unknow FileSystem Type. Couldn't extend filesystem size.\"",
+            "    exit 1",
+            "  fi",
+            "}",
+            "if [[ -f /sys/hypervisor/type ]] && [[ $(cat /sys/hypervisor/type) == 'xen' ]]; then",
+            "  DevName=${DevName/sda1/xvda}; DevName=${DevName/sda/xvda}; DevName=${DevName/sd/xvd}",
+            "  if ! [[ $DevName =~ 'dev' ]]; then DevName=\"/dev/$DevName\"; fi",
+            "  if [ $(lsblk -l $DevName | grep -v NAME| wc -l) -gt 1 ]; then",
+            "    partition=$(lsblk -l $DevName | grep -v NAME | cut -d ' ' -f 1 | grep -v \"^$(echo $DevName | awk -F/ '{print $NF}')$\" | sort -r | tail -1)",
+            "    partitionId=${partition: -1}",
+            "    growpart $DevName $partitionId",
+            "    GrowFS",
+            "  else",
+            "    partition=$(lsblk -l $DevName | grep -v NAME | cut -d ' ' -f 1 | tail -1)",
+            "    GrowFS",
+            "  fi",
+            "else",
+            "  VolumeId=${VolumeId/vol-/}",
+            "  for file in $(ls /sys/devices/pci*/0*/nvme/*/serial); do",
+            "    if [[ $(cat $file) =~ $VolumeId ]]; then",
+            "      DevName=$(cat ${file/serial/nvme*/uevent} | grep DEVNAME | cut -d= -f 2)",
+            "      if ! [[ $DevName =~ 'dev' ]]; then DevName=\"/dev/$DevName\"; fi",
+            "      break",
+            "    fi",
+            "  done",
+            "  if [ $(lsblk -l $DevName | grep -v NAME| wc -l) -gt 1 ]; then",
+            "    partition=$(lsblk -l $DevName | grep -v NAME | cut -d ' ' -f 1 | grep -v \"^$(echo $DevName | awk -F/ '{print $NF}')$\" | sort -r | tail -1)",
+            "    partitionId=${partition: -1}",
+            "    growpart $DevName $partitionId",
+            "    GrowFS",
+            "  else",
+            "    partition=$(lsblk -l $DevName | grep -v NAME | cut -d ' ' -f 1 | tail -1)",
+            "    GrowFS",
+            "  fi",
+            "fi"
+          ]
+        }
+      }
+    }
+  ]
+}
